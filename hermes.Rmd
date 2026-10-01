@@ -1,0 +1,256 @@
+---
+title: "Are Hermès Bags a Good Investment?"
+subtitle: "What 1,255 auction sales say about Birkin and Kelly prices, 2007 to 2021"
+author: "David Barrero"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)   # data wrangling and plots
+library(readxl)      # read the Excel file
+library(lubridate)   # dates
+library(here)        # project-relative file paths
+library(sandwich)    # robust standard errors
+library(lmtest)      # coeftest with robust SEs
+library(scales)      # axis labels
+library(knitr)       # tables
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 150)
+
+theme_set(theme_minimal(base_size = 12) +
+            theme(plot.title.position = "plot",
+                  panel.grid.minor = element_blank()))
+
+col_main <- "#1F4E79"   # standard bags / main series
+col_prem <- "#C8102E"   # premium bags / highlight
+```
+
+## The question
+
+A client owns a collection of Hermès Birkin and Kelly bags and wants to know two things. Should they keep holding the bags, buy more, or sell? And if they keep buying, which bags hold their value best?
+
+To answer that, I looked at auction results for Hermès bags and asked two questions. First, are prices actually rising over time? Second, what features make one bag worth more than another?
+
+## Data
+
+```{r load}
+hermes_raw <- read_excel(here("data", "hermes.xlsx"))
+
+hermes <- hermes_raw %>%
+  rename(auction = `Auction House`, color_cat = `Color Category`) %>%
+  mutate(
+    # clean stray spaces and case in a few category labels
+    across(c(Shape, color_cat, Hardware), str_trim),
+    Hardware  = toupper(Hardware),
+    year      = year(Date),
+    t         = decimal_date(Date) - 2007,   # years since 2007
+    log_price = log(Price),
+    # premium bags: Himalaya color or diamond / special hardware
+    premium   = color_cat == "Hima" | Hardware %in% c("D", "BG", "PVD"),
+    # set the most common or most basic category as the comparison group
+    Material  = relevel(factor(Material), "Alligator M"),
+    Shape     = factor(Shape),
+    Hardware  = relevel(factor(Hardware), "P"),
+    color_cat = relevel(factor(color_cat), "Black"),
+    auction   = relevel(factor(auction), "Christies")
+  )
+```
+
+The dataset was shared by my professor for a class project. It has `r comma(nrow(hermes))` exotic-skin Birkin and Kelly bags sold at auction between `r year(min(hermes$Date))` and `r year(max(hermes$Date))`, mostly at Christie's and Heritage Auctions. Each sale records the bag's style, size, skin, color, hardware, auction house, and sale price in US dollars. The median bag sold for `r dollar(median(hermes$Price))` and the most expensive went for `r dollar(max(hermes$Price))`.
+
+```{r sales-per-year}
+hermes %>%
+  count(year, name = "bags_sold") %>%
+  pivot_wider(names_from = year, values_from = bags_sold) %>%
+  kable(caption = "Bags in the dataset by year of sale")
+```
+
+There are very few sales before 2013, so I treat the early years with caution throughout.
+
+## The average price looks like it's rising
+
+```{r avg-price}
+yearly <- hermes %>%
+  filter(year >= 2010) %>%
+  group_by(year) %>%
+  summarize(Mean = mean(Price), Median = median(Price), .groups = "drop") %>%
+  pivot_longer(c(Mean, Median), names_to = "stat", values_to = "price")
+
+ggplot(yearly, aes(year, price, color = stat)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = dollar, limits = c(0, NA)) +
+  scale_x_continuous(breaks = 2010:2021) +
+  scale_color_manual(values = c(Mean = col_prem, Median = col_main)) +
+  labs(title = "Average sale price vs. median sale price, 2010 to 2021",
+       x = NULL, y = "Sale price", color = NULL)
+```
+
+The mean price climbs to about `r dollar(round(mean(hermes$Price[hermes$year == 2021]), -3))` in 2021, which is where a "prices keep going up" story would come from. The median tells a different story. The typical bag sold for less in 2021 than it did in 2010. When the mean and median move in different directions, it usually means a small number of very expensive sales are pulling the average up.
+
+## The mix of bags changed
+
+```{r premium-share}
+mix <- hermes %>%
+  filter(year >= 2010) %>%
+  group_by(year) %>%
+  summarize(share_premium = mean(premium), .groups = "drop")
+
+ggplot(mix, aes(year, share_premium)) +
+  geom_col(fill = col_prem) +
+  scale_y_continuous(labels = percent) +
+  scale_x_continuous(breaks = 2010:2021) +
+  labs(title = "Share of sales that were premium bags (Himalaya or diamond hardware)",
+       x = NULL, y = "Share of bags sold")
+```
+
+The most valuable Hermès bags are the Himalaya (a white-to-gray Niloticus crocodile) and bags with diamond hardware. None of the bags sold in 2010 were premium bags, but by 2017 they made up `r percent(mix$share_premium[mix$year == 2017])` of sales. More of the most expensive bags coming to auction makes the average go up, even if no individual type of bag is gaining value. To separate those two things I need to compare similar bags to each other.
+
+## What drives the price of a bag
+
+I regressed the log of sale price on the time of sale and every feature in the data: skin, style, size, hardware, color, and auction house. Using log price means each coefficient can be read as a percent difference in price, holding everything else constant.
+
+```{r hedonic}
+model <- lm(log_price ~ t + Material + Shape + Size + I(Size^2) +
+              Hardware + color_cat + auction, data = hermes)
+
+robust <- coeftest(model, vcov = vcovHC(model, type = "HC1"))
+
+# convert log-point coefficients to percent price differences
+pct <- function(b) exp(b) - 1
+
+yearly_change <- pct(coef(model)[["t"]])
+hima_prem     <- pct(coef(model)[["color_catHima"]])
+diamond_prem  <- pct(coef(model)[["HardwareD"]])
+niloticus_m   <- pct(coef(model)[["MaterialCrocodile M N"]])
+heritage      <- pct(coef(model)[["auctionHA"]])
+r2            <- summary(model)$r.squared
+```
+
+The model explains `r percent(r2, accuracy = 1)` of the variation in log prices. The full coefficient table is in the appendix. The features that matter most:
+
+```{r drivers}
+labels <- c(
+  "color_catHima"         = "Himalaya color (vs. black)",
+  "HardwareD"             = "Diamond hardware (vs. palladium)",
+  "HardwarePVD"           = "PVD (black) hardware (vs. palladium)",
+  "HardwareBG"            = "Brushed gold hardware (vs. palladium)",
+  "color_catPink"         = "Pink (vs. black)",
+  "color_catBrown"        = "Brown (vs. black)",
+  "ShapeKelly S"          = "Kelly Sellier (vs. Birkin)",
+  "MaterialCrocodile M N" = "Matte Niloticus crocodile (vs. matte alligator)",
+  "MaterialCrocodile S P" = "Shiny Porosus crocodile (vs. matte alligator)",
+  "auctionHA"             = "Heritage Auctions (vs. Christie's)",
+  "t"                     = "Each additional year"
+)
+
+drivers <- tibble(term = rownames(robust),
+                  est  = robust[, "Estimate"],
+                  se   = robust[, "Std. Error"]) %>%
+  filter(term %in% names(labels)) %>%
+  mutate(label = labels[term],
+         effect = pct(est),
+         lo = pct(est - 1.96 * se),
+         hi = pct(est + 1.96 * se),
+         label = fct_reorder(label, effect))
+
+ggplot(drivers, aes(effect, label, color = effect > 0)) +
+  geom_vline(xintercept = 0, color = "grey60") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.2) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(labels = percent) +
+  scale_color_manual(values = c(`TRUE` = col_main, `FALSE` = col_prem), guide = "none") +
+  labs(title = "Price difference for each feature, holding everything else constant",
+       subtitle = "Points are estimates; bars are 95% confidence intervals (robust SEs)",
+       x = "Difference in sale price", y = NULL)
+```
+
+A few things stand out:
+
+- **Himalaya bags sell for `r percent(hima_prem, accuracy = 1)` more** than a comparable black bag, and **diamond hardware adds `r percent(diamond_prem, accuracy = 1)`**. These two features matter far more than anything else.
+- **Crocodile is not automatically worth more than alligator.** Matte Niloticus crocodile actually sells for `r percent(abs(niloticus_m), accuracy = 1)` less than matte alligator once color is held constant. `r sum(hermes$color_cat == "Hima" & hermes$Material == "Crocodile M N")` of the `r sum(hermes$color_cat == "Hima")` Himalaya bags in the data are matte Niloticus crocodile, so a simple average by skin makes crocodile look more valuable than it is.
+- **Where a bag is sold matters.** The same bag sells for about `r percent(abs(heritage), accuracy = 1)` less at Heritage Auctions than at Christie's.
+
+## Price of a comparable bag over time
+
+Holding all of those features constant, the time trend shows how the value of the same kind of bag changed. On average, **a comparable bag sold for `r percent(abs(yearly_change), accuracy = 0.1)` less each year**.
+
+To see the year-by-year pattern instead of one average trend, I replaced the trend with a separate effect for each year starting in 2010, the first year with a reasonable number of sales.
+
+```{r index}
+index_model <- lm(log_price ~ factor(year) + Material + Shape + Size + I(Size^2) +
+                    Hardware + color_cat + auction,
+                  data = filter(hermes, year >= 2010))
+
+index <- tibble(term = names(coef(index_model)), est = coef(index_model)) %>%
+  filter(str_detect(term, "factor\\(year\\)")) %>%
+  mutate(year = as.integer(str_extract(term, "\\d{4}")),
+         index = 100 * exp(est)) %>%
+  select(year, index) %>%
+  add_row(year = 2010L, index = 100, .before = 1)
+
+raw_index <- hermes %>%
+  filter(year >= 2010) %>%
+  group_by(year) %>%
+  summarize(index = mean(Price), .groups = "drop") %>%
+  mutate(index = 100 * index / index[year == 2010])
+
+bind_rows(`Average sale price` = raw_index,
+          `Comparable bag (model)` = index, .id = "series") %>%
+  ggplot(aes(year, index, color = series)) +
+  geom_hline(yintercept = 100, color = "grey60") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = 2010:2021) +
+  scale_color_manual(values = c(`Average sale price` = col_prem,
+                                `Comparable bag (model)` = col_main)) +
+  labs(title = "Price index, 2010 = 100",
+       subtitle = "The comparable-bag index holds skin, style, size, color, hardware, and auction house constant",
+       x = NULL, y = "Index (2010 = 100)", color = NULL)
+```
+
+The average sale price ends 2021 above where it started, but the price of a comparable bag fell steadily from 2011 to 2018, bottoming out about `r percent(1 - min(index$index) / 100, accuracy = 1)` below 2010, before recovering some in 2021. These prices are also not adjusted for inflation, so in real terms the decline is even larger.
+
+## Recommendation
+
+**Don't count on the collection appreciating.** Once you compare similar bags, auction prices for most exotic Birkins and Kellys went down between 2010 and 2021, not up. The rising average in the raw data comes from more Himalaya and diamond bags being sold in later years.
+
+**If the client keeps buying, focus on the rarest pieces.** Himalaya color and diamond hardware carry by far the largest premiums. Paying extra for crocodile over alligator on its own isn't supported by the data.
+
+**If the client sells, the auction house matters.** Christie's sales came in meaningfully higher than Heritage Auctions for the same type of bag, so where the client sells could be worth more than when they sell.
+
+## Limitations
+
+- These are auction prices only. Private resale and boutique prices could behave differently.
+- Prices are in nominal dollars and not adjusted for inflation or currency changes.
+- There are few sales before 2013, so the early part of the index is less precise.
+- The model can't see a bag's condition, which is likely a big part of what's left unexplained.
+
+## Appendix: full regression results
+
+```{r full-table}
+tibble(Term = rownames(robust),
+       Estimate = robust[, "Estimate"],
+       `Robust SE` = robust[, "Std. Error"],
+       `p-value` = robust[, "Pr(>|t|)"]) %>%
+  mutate(`% effect` = if_else(Term == "(Intercept)", "", percent(pct(Estimate), accuracy = 0.1))) %>%
+  kable(digits = 3,
+        caption = paste0("OLS of log sale price, N = ", nobs(model),
+                         ", R-squared = ", round(r2, 2), ". Robust (HC1) standard errors."))
+```
+
+### Variable definitions
+
+| Variable | Meaning |
+|---|---|
+| Shape | Birkin, Kelly Sellier (Kelly S), or Kelly Retourne (Kelly R) |
+| Size | Bag width in centimeters |
+| Material | Skin and finish: Alligator matte (M) or shiny (S); Crocodile Niloticus (N) or Porosus (P), matte (M) or shiny (S) |
+| Hardware | P = palladium, G = gold, D = diamond, BG / BP = brushed gold / palladium, PVD = black PVD, R = other finish (only 8 bags) |
+| Color Category | Color family; Hima = Himalaya |
+| Auction House | Christie's, HA (Heritage Auctions), Poly (Poly Auction), Sotheby's, Artcurial |
